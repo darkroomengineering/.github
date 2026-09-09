@@ -1,0 +1,163 @@
+name: Merge verified Dependabot updates
+
+on:
+  workflow_call:
+    inputs:
+      update-policy:
+        description: stable-dependencies or actions-only
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # The reusable workflow keeps the caller's workflow_run event context.
+    if: >
+      github.repository_owner == 'darkroomengineering' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    steps:
+      - name: Validate update policy
+        env:
+          UPDATE_POLICY: ${{ inputs.update-policy }}
+        run: |
+          case "$UPDATE_POLICY" in
+            stable-dependencies|actions-only) ;;
+            *) echo 'Unsupported update policy.'; exit 1 ;;
+          esac
+
+      - name: Resolve Dependabot PR from head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -o pipefail
+          matches=$(gh api --paginate --slurp \
+            "/repos/$REPO/commits/$HEAD_SHA/pulls?per_page=100" | \
+            jq --arg sha "$HEAD_SHA" \
+              '[.[][] | select(.state == "open" and .head.sha == $sha)]')
+          count=$(echo "$matches" | jq 'length')
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly one open PR for sha $HEAD_SHA; found $count."
+            echo "Not auto-merging."
+            exit 0
+          fi
+
+          if ! echo "$matches" | jq -e --arg repo "$REPO" \
+            '.[0] | .user.login == "dependabot[bot]" and
+              .head.repo.full_name == $repo and .base.repo.full_name == $repo and
+              .base.ref == "main" and .draft == false' > /dev/null; then
+            echo "PR must be a ready Dependabot PR from this repository to main."
+            exit 0
+          fi
+          echo "number=$(echo "$matches" | jq -r '.[0].number')" >> "$GITHUB_OUTPUT"
+
+      - name: Verify a permitted stable patch or minor update
+        id: update_type
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          UPDATE_POLICY: ${{ inputs.update-policy }}
+        run: |
+          set -o pipefail
+          pr_json=$(gh pr view "$PR" --repo "$REPO" --json title,changedFiles,headRefOid)
+          if ! printf '%s\n' "$pr_json" | jq -e --arg sha "$HEAD_SHA" \
+            '.headRefOid == $sha' > /dev/null; then
+            echo "PR head changed; not auto-merging."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$UPDATE_POLICY" = 'actions-only' ]; then
+            # GitHub returns at most 3000 PR files. Require a complete,
+            # nonempty result, including the previous paths of renamed files.
+            if ! printf '%s\n' "$pr_json" | jq -e \
+              '.changedFiles > 0 and .changedFiles <= 3000' > /dev/null; then
+              echo "Unsupported file count; not auto-merging."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            file_count=$(printf '%s\n' "$pr_json" | jq '.changedFiles')
+            if ! gh api --paginate --slurp "/repos/$REPO/pulls/$PR/files?per_page=100" | \
+              jq -e --argjson count "$file_count" \
+                '[.[][]] as $files | ($files | length) == $count and
+                  all($files[]; (.filename | test("^\\.github/workflows/[^/]+\\.ya?ml$")) and
+                    ((.previous_filename // .filename) | test("^\\.github/workflows/[^/]+\\.ya?ml$")))' > /dev/null; then
+              echo "PR must change only workflow files, with a complete file list; not auto-merging."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          title=$(printf '%s\n' "$pr_json" | jq -r '.title')
+          # Unknown titles, grouped bumps, prereleases and 0.x stay manual.
+          version='[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          case "$UPDATE_POLICY" in
+            stable-dependencies)
+              pattern="^(chore\\(deps(-dev)?\\)|ci): [Bb]ump [@a-zA-Z0-9_./-]+ from $version to $version$"
+              ;;
+            actions-only)
+              pattern="^ci: [Bb]ump [a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+ from $version to $version$"
+              ;;
+            *) echo 'Unsupported update policy.'; exit 1 ;;
+          esac
+          transition=$(printf '%s\n' "$title" | grep -E "$pattern" || true)
+          if [ -z "$transition" ] || [ "$transition" != "$title" ]; then
+            echo "Title does not prove a stable single-package update; not auto-merging."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          from=$(echo "$transition" | awk '{print $(NF-2)}')
+          to=$(echo "$transition" | awk '{print $NF}')
+          if jq -en --arg from "$from" --arg to "$to" \
+            '($from | split(".") | map(tonumber)) as $a |
+              ($to | split(".") | map(tonumber)) as $b |
+              $a[0] == $b[0] and $b > $a' > /dev/null; then
+            echo "Stable patch/minor bump: $from -> $to. Eligible for auto-merge."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Major, unchanged or downgraded version: $from -> $to. Not auto-merging."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify latest CI run and squash merge
+        if: >
+          steps.pr.outputs.number != '' &&
+          steps.update_type.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -o pipefail
+          if ! gh api --paginate --slurp \
+            "/repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" | \
+            jq -e --arg sha "$HEAD_SHA" --argjson attempt "$RUN_ATTEMPT" \
+              --argjson run "$RUN_ID" --argjson workflow "$WORKFLOW_ID" \
+              '[.[].workflow_runs[] | select(.workflow_id == $workflow and
+                .event == "pull_request" and .head_sha == $sha)] |
+                max_by([.created_at, .id]) |
+                .id == $run and .run_attempt == $attempt and
+                .status == "completed" and .conclusion == "success"' > /dev/null; then
+            echo "CI was superseded, rerun or is not successful; not auto-merging."
+            exit 0
+          fi
+          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+            --match-head-commit "$HEAD_SHA"
