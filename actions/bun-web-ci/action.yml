@@ -1,0 +1,73 @@
+name: Bun web CI
+description: Build and check a Bun web application using its pinned runtime.
+
+inputs:
+  node-version-file:
+    description: Optional .node-version file for projects that also run Node tools.
+    required: false
+    default: ''
+  oxlint-annotations:
+    description: Run the existing Oxlint annotation command before checks.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Validate CI inputs and Bun pin
+      shell: bash
+      env:
+        NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+        OXLINT_ANNOTATIONS: ${{ inputs.oxlint-annotations }}
+      run: |
+        case "$NODE_VERSION_FILE" in
+          ''|.node-version) ;;
+          *) echo 'node-version-file must be empty or .node-version.'; exit 1 ;;
+        esac
+        case "$OXLINT_ANNOTATIONS" in
+          true|false) ;;
+          *) echo 'oxlint-annotations must be true or false.'; exit 1 ;;
+        esac
+        node -e '
+          const { readFileSync } = require("node:fs")
+          const { packageManager } = JSON.parse(readFileSync("package.json", "utf8"))
+          if (!/^bun@\d+\.\d+\.\d+$/.test(packageManager ?? "")) {
+            console.error("package.json must pin an exact stable Bun version.")
+            process.exit(1)
+          }
+        '
+
+    - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      with:
+        bun-version-file: package.json
+
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      if: inputs.node-version-file != ''
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+
+    - name: Install dependencies
+      shell: bash
+      run: bun install --frozen-lockfile
+
+    - name: Cache Next.js build
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: .next/cache
+        key: nextjs-${{ runner.os }}-${{ hashFiles('bun.lock') }}-${{ hashFiles('**/*.ts', '**/*.tsx') }}
+        restore-keys: |
+          nextjs-${{ runner.os }}-${{ hashFiles('bun.lock') }}-
+
+    # Build generates Next types before the project's checks run.
+    - name: Build
+      shell: bash
+      run: bun run build
+
+    - name: Lint annotations
+      if: inputs.oxlint-annotations == 'true'
+      shell: bash
+      run: bun oxlint --format=github --max-warnings=0
+
+    - name: Run checks
+      shell: bash
+      run: bun run check
