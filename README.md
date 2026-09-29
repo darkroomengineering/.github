@@ -19,6 +19,7 @@ CI components. Workflows and actions are not inherited by other repositories.
 | `.github/FUNDING.yml` | Sponsor button configuration. |
 | `actions/bun-web-ci/action.yml` | Shared Bun installation, production build and project checks. |
 | `.github/workflows/dependabot-merge.yml` | Guarded merge workflow for explicitly selected Dependabot policies. |
+| `.github/workflows/ci-gate.yml` | Org-required check on every default branch (see below). |
 
 ## Shared CI components
 
@@ -42,6 +43,22 @@ as a step after checkout. The caller owns its triggers, job names, read-only
 permissions, runner, timeout and cancellation policy. Keep browser tests and
 advisory jobs in the caller. For Satus, pass both inputs; for Lenis Showcase Admin,
 use the defaults. This action does not skip tests or accept arbitrary commands.
+
+## Required default-branch gate
+
+The org ruleset **Default branch gate** requires `ci-gate.yml` from this repository's
+`main` on the default branch of every repository except forks and repositories named
+in the ruleset's exclusions. Changes reach a default branch only through a pull request.
+Organization owners can bypass a failing gate on a pull request, never with a direct push.
+
+For a root Bun project (`package.json` plus `bun.lock`), the gate installs with
+`--frozen-lockfile`, generates Next.js route types when the project uses Next.js,
+and runs the `check` script, or `typecheck` when `check` is absent. It warns when
+`packageManager` lacks an exact `bun@x.y.z` pin and when neither script exists.
+Other repositories pass with a notice. Production builds stay with Vercel previews,
+which carry each project's environment variables.
+
+Every change to `ci-gate.yml` changes the gate for the whole organization.
 
 ## Dependabot merge policy
 
