@@ -1,0 +1,74 @@
+name: ci-gate
+
+# Required on every default branch by the org ruleset "Default branch gate".
+# It runs the project's own `check` script (or `typecheck`) for Bun projects and
+# passes with a notice for everything else. Production builds stay with Vercel
+# previews because they need per-project environment variables.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect project
+        id: detect
+        shell: bash
+        run: |
+          if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+            echo "::notice::No Bun project at the repository root; nothing to gate."
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pin=$(jq -r '.packageManager // ""' package.json)
+          if [[ "$pin" =~ ^bun@[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "bun-version=${pin#bun@}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::package.json has no exact packageManager pin (bun@x.y.z); using the latest Bun."
+            echo "bun-version=latest" >> "$GITHUB_OUTPUT"
+          fi
+          script=$(jq -r 'if .scripts.check then "check" elif .scripts.typecheck then "typecheck" else "" end' package.json)
+          if [ -z "$script" ]; then
+            echo "::warning::package.json defines neither a check nor a typecheck script; nothing to gate."
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "script=$script" >> "$GITHUB_OUTPUT"
+          echo "kind=bun" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.detect.outputs.kind == 'bun'
+        with:
+          bun-version: ${{ steps.detect.outputs.bun-version }}
+
+      - name: Install dependencies
+        if: steps.detect.outputs.kind == 'bun'
+        run: bun install --frozen-lockfile
+
+      # Next.js route types normally come from a build; typegen produces them without one.
+      - name: Generate Next.js types
+        if: steps.detect.outputs.kind == 'bun' && hashFiles('next.config.*') != ''
+        shell: bash
+        run: |
+          if bun next --help 2>/dev/null | grep -q typegen; then
+            bun next typegen
+          fi
+
+      - name: Run ${{ steps.detect.outputs.script }}
+        if: steps.detect.outputs.kind == 'bun'
+        run: bun run ${{ steps.detect.outputs.script }}
