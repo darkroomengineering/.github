@@ -4,6 +4,10 @@ name: ci-gate
 # It runs the project's own `check` script (or `typecheck`) for Bun projects and
 # passes with a notice for everything else. Production builds stay with Vercel
 # previews because they need per-project environment variables.
+#
+# A repository whose own ruleset already requires a status check on the default
+# branch has its own enforced CI. The gate passes for it with a notice and does
+# not install or run anything.
 
 on:
   pull_request:
@@ -22,12 +26,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # A required status check from any active ruleset on the default branch
+      # counts, except `check`, the name of this job. When the API call fails,
+      # the gate runs as usual.
+      - name: Detect own CI
+        id: own
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          checks=$(gh api --paginate --slurp "/repos/$REPO/rules/branches/$BRANCH" | jq -r \
+            '[.[][] | select(.type == "required_status_checks") |
+              .parameters.required_status_checks[].context | select(. != "check")] |
+              unique | join(", ")' || true)
+          if [ -n "$checks" ]; then
+            echo "::notice::The default branch already requires its own checks ($checks); nothing to gate."
+            echo "enforced=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.own.outputs.enforced != 'true'
         with:
           persist-credentials: false
 
       - name: Detect project
         id: detect
+        if: steps.own.outputs.enforced != 'true'
         shell: bash
         run: |
           if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
@@ -55,6 +81,13 @@ jobs:
         if: steps.detect.outputs.kind == 'bun'
         with:
           bun-version: ${{ steps.detect.outputs.bun-version }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.detect.outputs.kind == 'bun'
+        with:
+          path: ~/.bun/install/cache
+          key: ci-gate-bun-${{ runner.os }}-${{ hashFiles('bun.lock', 'bun.lockb') }}
+          restore-keys: ci-gate-bun-${{ runner.os }}-
 
       - name: Install dependencies
         if: steps.detect.outputs.kind == 'bun'
