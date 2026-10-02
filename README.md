@@ -58,6 +58,13 @@ and runs the `check` script, or `typecheck` when `check` is absent. It warns whe
 Other repositories pass with a notice. Production builds stay with Vercel previews,
 which carry each project's environment variables.
 
+A repository with its own CI makes that CI a required status check in its own
+ruleset for the default branch. The gate then passes with a notice and installs
+and runs nothing. A file in the repository does not count: only a required check
+does, so a repository cannot leave the gate without enforced CI. The gate still
+starts a job, and GitHub bills each job as at least one minute. To save that
+minute too, an owner names the repository in the ruleset's exclusions.
+
 Every change to `ci-gate.yml` changes the gate for the whole organization.
 
 ## Dependabot merge policy
