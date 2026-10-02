@@ -64,7 +64,8 @@ Every change to `ci-gate.yml` changes the gate for the whole organization.
 
 Call `darkroomengineering/.github/.github/workflows/dependabot-merge.yml@<reviewed-full-commit-sha>`
 as a job from a `workflow_run` caller listening for completion of its verified
-CI workflow. Pass the required `update-policy` input:
+CI workflow. Pass the required `update-policy` input, and optionally
+`min-release-age-days`:
 
 | Policy | Eligible updates |
 | --- | --- |
@@ -77,6 +78,28 @@ the exact current head, and a successful latest run and attempt of the triggerin
 CI workflow. Actions-only changes require the complete paginated file list,
 including previous paths for renames. Merge uses `--match-head-commit` without
 an administrative bypass.
+
+Two more guards apply to every caller:
+
+- **Real CI only.** The workflow does not merge when the triggering run is
+  `ci-gate`. That gate only type-checks, which does not prove that an update
+  works. The caller's workflow must build and test the project.
+- **Release age.** The updated version must be public for at least
+  `min-release-age-days` (default 7). Malicious releases are usually found and
+  removed within days. The workflow reads the publish date from the npm registry,
+  or from the GitHub release for an Action. A release without a readable date
+  stays manual.
+
+Set the same delay as a Dependabot `cooldown` in the caller's `dependabot.yml`,
+so that a PR only opens for a release that is old enough:
+
+```yaml
+cooldown:
+  default-days: 7
+```
+
+Without the cooldown, a PR for a young release stays open and is not merged.
+The workflow runs again only when its CI runs again.
 
 The caller grants `actions: read`, `contents: write` and `pull-requests: write`.
 The workflow uses the caller's automatic `GITHUB_TOKEN`; do not pass a token or
