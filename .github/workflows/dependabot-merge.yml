@@ -12,6 +12,11 @@ on:
         required: false
         type: number
         default: 7
+      ci-workflow:
+        description: Name of the CI workflow whose latest run on the head must pass. Used when an approval triggers the run.
+        required: false
+        type: string
+        default: CI
 
 permissions:
   actions: read
@@ -21,14 +26,25 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    # The reusable workflow keeps the caller's workflow_run event context.
+    # The reusable workflow keeps the caller's event context. CI finishing and
+    # an approval both start a run, and each run checks the current head from
+    # scratch, so a merge needs green CI and an approval on that same commit.
+    # Nothing is left armed between runs.
     if: >
-      github.repository_owner == 'darkroomengineering' &&
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.name != 'ci-gate' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.repository_owner == 'darkroomengineering' && (
+        (github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'pull_request' &&
+          github.event.workflow_run.name != 'ci-gate' &&
+          github.event.workflow_run.head_repository.full_name == github.repository) ||
+        (github.event_name == 'pull_request_review' &&
+          github.event.review.state == 'approved' &&
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: dependabot-merge-${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+    env:
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
     steps:
       - name: Validate update policy
         env:
@@ -43,7 +59,6 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           REPO: ${{ github.repository }}
         run: |
           set -o pipefail
@@ -74,7 +89,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           UPDATE_POLICY: ${{ inputs.update-policy }}
         run: |
           set -o pipefail
@@ -185,32 +199,71 @@ jobs:
           echo "$PACKAGE $VERSION is $age days old."
           echo "old_enough=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify latest CI run and squash merge
+      - name: Verify latest CI run, approval and squash merge
         if: >
           steps.pr.outputs.number != '' &&
           steps.update_type.outputs.skip == 'false' &&
           steps.age.outputs.old_enough == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT: ${{ github.event_name }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          CI_WORKFLOW: ${{ inputs.ci-workflow }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.number }}
         run: |
           set -o pipefail
+          # A CI-triggered run must be the latest run and attempt on the head.
+          # An approval-triggered run looks up the named CI workflow instead.
+          exact=true
+          if [ "$EVENT" != 'workflow_run' ]; then
+            if [ "$CI_WORKFLOW" = 'ci-gate' ]; then
+              echo 'ci-gate does not prove an update works; not auto-merging.'
+              exit 0
+            fi
+            ids=$(gh api --paginate --slurp "/repos/$REPO/actions/workflows?per_page=100" | \
+              jq --arg name "$CI_WORKFLOW" '[.[].workflows[] | select(.name == $name) | .id]')
+            if [ "$(jq 'length' <<< "$ids")" -ne 1 ]; then
+              echo "Expected exactly one workflow named $CI_WORKFLOW; not auto-merging."
+              exit 0
+            fi
+            WORKFLOW_ID=$(jq '.[0]' <<< "$ids")
+            RUN_ID=0 RUN_ATTEMPT=0 exact=false
+          fi
           if ! gh api --paginate --slurp \
             "/repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=100" | \
             jq -e --arg sha "$HEAD_SHA" --argjson attempt "$RUN_ATTEMPT" \
               --argjson run "$RUN_ID" --argjson workflow "$WORKFLOW_ID" \
+              --argjson exact "$exact" \
               '[.[].workflow_runs[] | select(.workflow_id == $workflow and
                 .event == "pull_request" and .head_sha == $sha)] |
                 max_by([.created_at, .id]) |
-                .id == $run and .run_attempt == $attempt and
+                (if $exact then .id == $run and .run_attempt == $attempt else true end) and
                 .status == "completed" and .conclusion == "success"' > /dev/null; then
             echo "CI was superseded, rerun or is not successful; not auto-merging."
             exit 0
           fi
+
+          # The workflow never approves. When the branch rules want a review,
+          # a person must have approved this exact commit, so an approval of an
+          # earlier head does not carry over to a version this run has not seen.
+          decision=$(gh pr view "$PR" --repo "$REPO" --json reviewDecision --jq '.reviewDecision')
+          case "$decision" in
+            '') ;;
+            APPROVED)
+              if ! gh api --paginate --slurp "/repos/$REPO/pulls/$PR/reviews?per_page=100" | \
+                jq -e --arg sha "$HEAD_SHA" \
+                  'any(.[][]; .state == "APPROVED" and .commit_id == $sha and .user.type == "User")' > /dev/null; then
+                echo "No approval on $HEAD_SHA yet; waiting for one."
+                exit 0
+              fi
+              ;;
+            *)
+              echo "Review decision is $decision; waiting for an approval."
+              exit 0
+              ;;
+          esac
           gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
             --match-head-commit "$HEAD_SHA"
