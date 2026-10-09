@@ -70,9 +70,25 @@ Every change to `ci-gate.yml` changes the gate for the whole organization.
 ## Dependabot merge policy
 
 Call `darkroomengineering/.github/.github/workflows/dependabot-merge.yml@<reviewed-full-commit-sha>`
-as a job from a `workflow_run` caller listening for completion of its verified
-CI workflow. Pass the required `update-policy` input, and optionally
-`min-release-age-days`:
+as a job from a caller that listens for two events: completion of its verified
+CI workflow, and submitted pull request reviews. Pass the required
+`update-policy` input, and optionally `min-release-age-days` and `ci-workflow`
+(the CI workflow's name, default `CI`):
+
+```yaml
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+  pull_request_review:
+    types: [submitted]
+```
+
+The workflow never approves a PR. Where a ruleset requires a review, it merges
+only when a person has approved the exact head commit, so whichever comes last,
+green CI or the approval, triggers the merge. Both runs check the head from
+scratch, and nothing stays armed between them: a later Dependabot push to the
+PR needs its own CI and its own approval.
 
 | Policy | Eligible updates |
 | --- | --- |
@@ -81,21 +97,15 @@ CI workflow. Pass the required `update-policy` input, and optionally
 
 Major, 0.x, prerelease, grouped and unrecognized titles remain manual. The workflow
 requires a unique open, nondraft Dependabot PR from the same repository to `main`,
-the exact current head, and a successful latest run and attempt of the triggering
-CI workflow. Actions-only changes require the complete paginated file list,
+the exact current head, and a successful latest run and attempt of the CI
+workflow on that head. Actions-only changes require the complete paginated file list,
 including previous paths for renames. Merge uses `--match-head-commit` without
 an administrative bypass.
 
-The workflow never approves a PR. When the branch rules still need something,
-usually the approving review that the `Review required` ruleset asks for, it
-arms GitHub auto-merge instead, and the PR merges as soon as a person approves.
-The caller repository must turn on **Allow auto-merge** (Settings, General, Pull
-Requests), or the merge step fails.
-
 Two more guards apply to every caller:
 
-- **Real CI only.** The workflow does not merge when the triggering run is
-  `ci-gate`. That gate only type-checks, which does not prove that an update
+- **Real CI only.** The workflow does not merge when the triggering run, or
+  `ci-workflow`, is `ci-gate`. That gate only type-checks, which does not prove that an update
   works. The caller's workflow must build and test the project.
 - **Release age.** The updated version must be public for at least
   `min-release-age-days` (default 7). Malicious releases are usually found and
@@ -112,7 +122,7 @@ cooldown:
 ```
 
 Without the cooldown, a PR for a young release stays open and is not merged.
-The workflow runs again only when its CI runs again.
+The workflow runs again only when its CI runs again or someone approves.
 
 The caller grants `actions: read`, `contents: write` and `pull-requests: write`.
 The workflow uses the caller's automatic `GITHUB_TOKEN`; do not pass a token or
