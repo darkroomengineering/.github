@@ -86,6 +86,12 @@ CI workflow. Actions-only changes require the complete paginated file list,
 including previous paths for renames. Merge uses `--match-head-commit` without
 an administrative bypass.
 
+The workflow never approves a PR. When the branch rules still need something,
+usually the approving review that the `Review required` ruleset asks for, it
+arms GitHub auto-merge instead, and the PR merges as soon as a person approves.
+The caller repository must turn on **Allow auto-merge** (Settings, General, Pull
+Requests), or the merge step fails.
+
 Two more guards apply to every caller:
 
 - **Real CI only.** The workflow does not merge when the triggering run is

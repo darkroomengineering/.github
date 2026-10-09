@@ -185,7 +185,7 @@ jobs:
           echo "$PACKAGE $VERSION is $age days old."
           echo "old_enough=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify latest CI run and squash merge
+      - name: Verify latest CI run and squash merge or arm auto-merge
         if: >
           steps.pr.outputs.number != '' &&
           steps.update_type.outputs.skip == 'false' &&
@@ -212,5 +212,9 @@ jobs:
             echo "CI was superseded, rerun or is not successful; not auto-merging."
             exit 0
           fi
-          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+          # --auto merges now when the PR already meets the branch rules, and
+          # otherwise arms auto-merge so a human approval completes it. Cost: a
+          # later Dependabot push keeps auto-merge armed, so an approval given
+          # before that head's CI finishes merges it on the required checks alone.
+          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch --auto \
             --match-head-commit "$HEAD_SHA"
