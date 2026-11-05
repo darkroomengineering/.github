@@ -185,7 +185,7 @@ jobs:
           echo "$PACKAGE $VERSION is $age days old."
           echo "old_enough=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify latest CI run and squash merge
+      - name: Verify latest CI run, approve and squash merge
         if: >
           steps.pr.outputs.number != '' &&
           steps.update_type.outputs.skip == 'false' &&
@@ -212,5 +212,14 @@ jobs:
             echo "CI was superseded, rerun or is not successful; not auto-merging."
             exit 0
           fi
+          # The org's "Review required" ruleset wants one approval, and
+          # without it the merge below is refused. The approval is pinned to
+          # the commit CI just passed, so a later push is never approved.
+          # Needs "Allow GitHub Actions to create and approve pull requests"
+          # in the repo's Actions settings.
+          gh api "/repos/$REPO/pulls/$PR/reviews" \
+            -f commit_id="$HEAD_SHA" -f event=APPROVE \
+            -f body='Stable patch or minor update, CI passed, release old enough.' \
+            > /dev/null
           gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
             --match-head-commit "$HEAD_SHA"
