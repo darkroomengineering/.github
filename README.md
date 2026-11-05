@@ -83,8 +83,13 @@ Major, 0.x, prerelease, grouped and unrecognized titles remain manual. The workf
 requires a unique open, nondraft Dependabot PR from the same repository to `main`,
 the exact current head, and a successful latest run and attempt of the triggering
 CI workflow. Actions-only changes require the complete paginated file list,
-including previous paths for renames. Merge uses `--match-head-commit` without
-an administrative bypass.
+including previous paths for renames. The workflow then approves the PR at the
+head CI passed, which the org's "Review required" ruleset needs, and merges with
+`--match-head-commit` without an administrative bypass. If the merge fails, the
+workflow dismisses its approval, because the ruleset keeps approvals after a
+push. The approval needs
+"Allow GitHub Actions to create and approve pull requests" on in the caller
+repository's Actions settings; without it, the workflow fails at the approval.
 
 Two more guards apply to every caller:
 
