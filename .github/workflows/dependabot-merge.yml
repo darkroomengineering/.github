@@ -214,12 +214,19 @@ jobs:
           fi
           # The org's "Review required" ruleset wants one approval, and
           # without it the merge below is refused. The approval is pinned to
-          # the commit CI just passed, so a later push is never approved.
+          # the commit CI just passed. The ruleset does not dismiss stale
+          # approvals on push, so a failed merge dismisses it: left in place,
+          # it would let a later push merge without a human review.
           # Needs "Allow GitHub Actions to create and approve pull requests"
           # in the repo's Actions settings.
-          gh api "/repos/$REPO/pulls/$PR/reviews" \
+          review_id=$(gh api "/repos/$REPO/pulls/$PR/reviews" \
             -f commit_id="$HEAD_SHA" -f event=APPROVE \
             -f body='Stable patch or minor update, CI passed, release old enough.' \
-            > /dev/null
-          gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
-            --match-head-commit "$HEAD_SHA"
+            --jq .id)
+          if ! gh pr merge "$PR" --repo "$REPO" --squash --delete-branch \
+            --match-head-commit "$HEAD_SHA"; then
+            gh api -X PUT "/repos/$REPO/pulls/$PR/reviews/$review_id/dismissals" \
+              -f message='Auto-merge failed; approval withdrawn.' > /dev/null || \
+              echo "::error::Merge failed and the approval could not be dismissed. Dismiss review $review_id on #$PR by hand."
+            exit 1
+          fi
