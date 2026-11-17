@@ -72,6 +72,7 @@ errors much faster. Name the script `typecheck`, not `check`: `bun check` runs a
 | `lint`, `typecheck`, `build`, `test` | The commands. The workflow appends `bun test` flags to `test`. | See above |
 | `lint-paths`, `typecheck-paths`, `build-paths`, `test-paths` | Git pathspecs, one per line. A pull request that touches none of them skips that step. `:!docs` style exclusions alone mean "anything else". | Empty, always run |
 | `full-test-paths` | Extra pathspecs that make a pull request run every test, such as fixtures read from disk. | Empty |
+| `id` | Names this call's timings cache and artifacts. Set it when one workflow calls bun-ci more than once. | `main` |
 | `shards` | Test jobs on GitHub-hosted runners, 1 to 8. | `1` |
 | `no-isolate` | Self-hosted only: `bun test --parallel --no-isolate`. Faster, but test files can see each other's leftovers. | `false` |
 | `main-delay` | Seconds a push to the default branch waits, so a newer push cancels it first. `0` turns it off. | `60` |
