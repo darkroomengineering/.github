@@ -1,0 +1,429 @@
+name: bun-ci
+
+# Lint, typecheck, build and test for a Bun project, called from the project's own workflow.
+#
+# On GitHub-hosted runners each step is its own job and tests split into `shards` jobs, all in
+# parallel. On a self-hosted runner (a `runs-on` list that includes "self-hosted") one job runs the
+# steps as parallel processes and the tests with `bun test --parallel`, because those runners are
+# few and CPU-bound.
+#
+# Pull requests skip steps whose paths did not change and run only the tests the diff can reach
+# (`bun test --changed`). Every other event runs everything. Full runs record per-file test times in
+# the Actions cache, and the next run balances its shards with them.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner as JSON, such as '"ubuntu-latest"' or '["self-hosted","macOS"]'.
+        type: string
+        default: '"ubuntu-latest"'
+      bun-version:
+        description: Bun version to install. Empty reads the packageManager pin in package.json.
+        type: string
+        default: ""
+      setup:
+        description: Command run after install in every job, such as `bun next typegen`. Empty skips it.
+        type: string
+        default: ""
+      lint:
+        description: Lint command. Empty skips linting.
+        type: string
+        default: bun run lint
+      typecheck:
+        description: Typecheck command. Empty skips it. Use `bun check --no-script` when the project has a `check` script.
+        type: string
+        default: bun run typecheck
+      build:
+        description: Build command. Empty skips the build.
+        type: string
+        default: ""
+      test:
+        description: Test command. The workflow appends bun test flags, so it must be `bun test` or a script that passes arguments on.
+        type: string
+        default: bun test
+      lint-paths:
+        description: Git pathspecs, one per line, that lint depends on. A pull request touching none of them skips lint. Empty always runs.
+        type: string
+        default: ""
+      typecheck-paths:
+        description: Git pathspecs, one per line, that the typecheck depends on. Empty always runs.
+        type: string
+        default: ""
+      build-paths:
+        description: Git pathspecs, one per line, that the build depends on. Empty always runs.
+        type: string
+        default: ""
+      test-paths:
+        description: Git pathspecs, one per line, that tests depend on. Empty always runs.
+        type: string
+        default: ""
+      full-test-paths:
+        description: Extra git pathspecs, one per line, that make a pull request run every test, such as fixtures that tests read from disk. Manifests, lockfiles, tsconfig, bunfig and .github are always included.
+        type: string
+        default: ""
+      shards:
+        description: Test jobs on GitHub-hosted runners, 1 to 8.
+        type: number
+        default: 1
+      no-isolate:
+        description: On self-hosted runners, pass --no-isolate to `bun test --parallel`. Faster, but test files can see each other's leftovers.
+        type: boolean
+        default: false
+      main-delay:
+        description: Seconds a push to the default branch waits before running, so a newer push cancels it first. 0 disables the wait.
+        type: number
+        default: 60
+      timeout-minutes:
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+# Pull requests cancel their previous run. Other runs never queue behind each other here; the
+# `settle` job cancels a superseded push to the default branch while it is still waiting. The group
+# must differ from any group in the caller, or GitHub cancels the run as a deadlock.
+concurrency:
+  group: bun-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUN_CI_LINT: ${{ inputs.lint }}
+  BUN_CI_TYPECHECK: ${{ inputs.typecheck }}
+  BUN_CI_BUILD: ${{ inputs.build }}
+  BUN_CI_TEST: ${{ inputs.test }}
+  BUN_CI_SETUP: ${{ inputs.setup }}
+  BUN_CI_LINT_PATHS: ${{ inputs.lint-paths }}
+  BUN_CI_TYPECHECK_PATHS: ${{ inputs.typecheck-paths }}
+  BUN_CI_BUILD_PATHS: ${{ inputs.build-paths }}
+  BUN_CI_TEST_PATHS: ${{ inputs.test-paths }}
+  BUN_CI_FULL_TEST_PATHS: ${{ inputs.full-test-paths }}
+  # Inside node_modules so no linter, formatter or git sees it, and relative so the cache entry
+  # matches across runners with different workspace paths.
+  BUN_CI_TIMINGS: node_modules/.cache/bun-ci/test-timings.json
+
+jobs:
+  settle:
+    if: >-
+      inputs.main-delay > 0 && github.event_name == 'push' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    concurrency:
+      group: bun-ci-settle-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Wait for a newer push
+        env:
+          DELAY: ${{ inputs.main-delay }}
+        run: sleep "$DELAY"
+
+  lint:
+    needs: settle
+    if: >-
+      !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
+      !contains(inputs.runs-on, 'self-hosted') && inputs.lint != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      BUN_CI_STEP: lint
+    steps:
+      # Blobless with full history on pull requests: commits and trees for the diff against the base
+      # branch, file contents only for the checkout. The diff needs no blobs, so no credentials stay.
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          persist-credentials: false
+
+      # Outputs lint, typecheck, build and test as true or false, run (this job's step, or any step
+      # when BUN_CI_STEP is unset), and changed (the base for `bun test --changed`, or empty).
+      - &scope
+        name: Scope
+        id: scope
+        run: |
+          pr=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            pr=true
+            base="origin/$GITHUB_BASE_REF"
+            git merge-base "$base" HEAD > /dev/null
+          fi
+
+          # True when the pull request touches the newline-separated pathspecs in $1, or $1 is empty.
+          touches() {
+            local specs=() line files
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then specs+=("$line"); fi
+            done <<< "$1"
+            if [ "${#specs[@]}" -eq 0 ]; then return 0; fi
+            files=$(git diff --name-only --no-renames "$base...HEAD" -- "${specs[@]}") || exit 1
+            [ -n "$files" ]
+          }
+
+          # `bun test --changed` follows imports only. A dependency, config or fixture change reaches
+          # no test that way, so it runs every test, whatever test-paths says.
+          full_suite=true
+          if [ "$pr" = true ]; then
+            full=$(printf '%s\n' package.json '*/package.json' bun.lock bun.lockb '*/bun.lock' \
+              bunfig.toml '*/bunfig.toml' 'tsconfig*.json' '*/tsconfig*.json' .github)
+            full="$full"$'\n'"$BUN_CI_FULL_TEST_PATHS"
+            if ! touches "$full"; then full_suite=false; fi
+          fi
+
+          any=false
+          for step in lint typecheck build test; do
+            upper=$(printf '%s' "$step" | tr '[:lower:]' '[:upper:]')
+            cmd_var="BUN_CI_$upper"
+            paths_var="BUN_CI_${upper}_PATHS"
+            run=true
+            if [ -z "${!cmd_var}" ]; then
+              run=false
+            elif [ "$step" = test ] && [ "$full_suite" = true ]; then
+              run=true
+            elif [ "$pr" = true ] && ! touches "${!paths_var}"; then
+              run=false
+              echo "::notice::Skipping $step: this pull request changes none of its paths."
+            fi
+            if [ "$run" = true ]; then any=true; fi
+            echo "$step=$run" >> "$GITHUB_OUTPUT"
+            if [ "$step" = "${BUN_CI_STEP:-}" ]; then echo "run=$run" >> "$GITHUB_OUTPUT"; fi
+          done
+          if [ -z "${BUN_CI_STEP:-}" ]; then echo "run=$any" >> "$GITHUB_OUTPUT"; fi
+
+          if [ "$pr" = true ] && [ "$full_suite" = false ]; then echo "changed=$base" >> "$GITHUB_OUTPUT"; fi
+
+      - &setup-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.scope.outputs.run == 'true'
+        with:
+          bun-version: ${{ inputs.bun-version }}
+          bun-version-file: ${{ inputs.bun-version == '' && 'package.json' || '' }}
+
+      - &install-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.run == 'true'
+        with:
+          path: ~/.bun/install/cache
+          key: bun-ci-install-${{ runner.os }}-${{ hashFiles('bun.lock', 'bun.lockb') }}
+          restore-keys: bun-ci-install-${{ runner.os }}-
+
+      - &install
+        name: Install dependencies
+        if: steps.scope.outputs.run == 'true'
+        run: bun install --frozen-lockfile
+
+      - &setup
+        name: Setup
+        if: steps.scope.outputs.run == 'true' && env.BUN_CI_SETUP != ''
+        run: eval "$BUN_CI_SETUP"
+
+      - name: Lint
+        if: steps.scope.outputs.run == 'true'
+        run: eval "$BUN_CI_LINT"
+
+  typecheck:
+    needs: settle
+    if: >-
+      !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
+      !contains(inputs.runs-on, 'self-hosted') && inputs.typecheck != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      BUN_CI_STEP: typecheck
+    steps:
+      - *checkout
+      - *scope
+      - *setup-bun
+      - *install-cache
+      - *install
+      - *setup
+      - name: Typecheck
+        if: steps.scope.outputs.run == 'true'
+        run: eval "$BUN_CI_TYPECHECK"
+
+  build:
+    needs: settle
+    if: >-
+      !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
+      !contains(inputs.runs-on, 'self-hosted') && inputs.build != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      BUN_CI_STEP: build
+    steps:
+      - *checkout
+      - *scope
+      - *setup-bun
+      - *install-cache
+      - *install
+      - *setup
+      - name: Build
+        if: steps.scope.outputs.run == 'true'
+        run: eval "$BUN_CI_BUILD"
+
+  test:
+    name: ${{ inputs.shards > 1 && format('test {0}/{1}', matrix.shard, inputs.shards) || 'test' }}
+    needs: settle
+    if: >-
+      !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
+      !contains(inputs.runs-on, 'self-hosted') && inputs.test != ''
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      BUN_CI_STEP: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # Expressions have no range function; index 0 is unused so `shards` indexes directly.
+        shard: ${{ fromJSON('[[1],[1],[1,2],[1,2,3],[1,2,3,4],[1,2,3,4,5],[1,2,3,4,5,6],[1,2,3,4,5,6,7],[1,2,3,4,5,6,7,8]]')[inputs.shards] }}
+    steps:
+      - *checkout
+      - *scope
+      - *setup-bun
+      - *install-cache
+      - *install
+      - *setup
+
+      # Every shard must read the same timings, or the shards split the files differently and some
+      # run twice or never. Restoring the exact entry of the base commit keeps that true while that
+      # entry exists.
+      - &restore-timings
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.test == 'true'
+        with:
+          path: ${{ env.BUN_CI_TIMINGS }}
+          key: bun-ci-timings-${{ runner.os }}-${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          restore-keys: bun-ci-timings-${{ runner.os }}-
+
+      - name: Test
+        if: steps.scope.outputs.run == 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          CHANGED: ${{ steps.scope.outputs.changed }}
+        run: |
+          mkdir -p "$(dirname "$BUN_CI_TIMINGS")"
+          args=(--timings="$BUN_CI_TIMINGS")
+          if [ "$SHARDS" -gt 1 ]; then args+=(--shard="$SHARD/$SHARDS"); fi
+          if [ -n "$CHANGED" ]; then args+=(--changed="$CHANGED"); fi
+          # A pull request runs part of the suite, so only full runs record timings.
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then args+=(--update-timings); fi
+          eval "$BUN_CI_TEST"' "${args[@]}"'
+
+      - name: Save test timings
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.run == 'true' && github.event_name != 'pull_request' && inputs.shards == 1
+        with:
+          path: ${{ env.BUN_CI_TIMINGS }}
+          key: bun-ci-timings-${{ runner.os }}-${{ github.sha }}
+
+      # Each shard records only its own files; the timings job merges them.
+      - name: Upload shard timings
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.run == 'true' && github.event_name != 'pull_request' && inputs.shards > 1
+        with:
+          name: bun-ci-timings-${{ matrix.shard }}
+          path: ${{ env.BUN_CI_TIMINGS }}
+          include-hidden-files: true
+          retention-days: 1
+
+  timings:
+    needs: test
+    if: >-
+      !cancelled() && needs.test.result == 'success' && github.event_name != 'pull_request' &&
+      inputs.shards > 1
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bun-ci-timings-*
+          path: ${{ runner.temp }}/timings
+
+      - name: Merge shard timings
+        env:
+          PARTS: ${{ runner.temp }}/timings
+        run: |
+          mkdir -p "$(dirname "$BUN_CI_TIMINGS")"
+          jq -s '{version: .[0].version, files: (map(.files) | add)}' "$PARTS"/*/*.json > "$BUN_CI_TIMINGS"
+          jq -r '"Recorded \(.files | length) test files."' "$BUN_CI_TIMINGS"
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BUN_CI_TIMINGS }}
+          key: bun-ci-timings-${{ runner.os }}-${{ github.sha }}
+
+  parallel:
+    name: ci
+    needs: settle
+    if: >-
+      !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
+      contains(inputs.runs-on, 'self-hosted')
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - *checkout
+      - *scope
+      - *setup-bun
+      # No install cache: a self-hosted runner keeps ~/.bun/install/cache between runs.
+      - *install
+      - *setup
+      - *restore-timings
+
+      - name: Lint, typecheck, build and test
+        if: steps.scope.outputs.run == 'true'
+        env:
+          RUN_LINT: ${{ steps.scope.outputs.lint }}
+          RUN_TYPECHECK: ${{ steps.scope.outputs.typecheck }}
+          RUN_BUILD: ${{ steps.scope.outputs.build }}
+          RUN_TEST: ${{ steps.scope.outputs.test }}
+          CHANGED: ${{ steps.scope.outputs.changed }}
+          NO_ISOLATE: ${{ inputs.no-isolate }}
+          LOGS: ${{ runner.temp }}/bun-ci
+        run: |
+          mkdir -p "$LOGS" "$(dirname "$BUN_CI_TIMINGS")"
+          args=(--parallel --timings="$BUN_CI_TIMINGS")
+          if [ "$NO_ISOLATE" = true ]; then args+=(--no-isolate); fi
+          if [ -n "$CHANGED" ]; then args+=(--changed="$CHANGED"); fi
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then args+=(--update-timings); fi
+
+          names=()
+          pids=()
+          start() {
+            ( eval "$2" ) > "$LOGS/$1.log" 2>&1 &
+            names+=("$1")
+            pids+=("$!")
+          }
+          if [ "$RUN_LINT" = true ]; then start lint "$BUN_CI_LINT"; fi
+          if [ "$RUN_TYPECHECK" = true ]; then start typecheck "$BUN_CI_TYPECHECK"; fi
+          if [ "$RUN_BUILD" = true ]; then start build "$BUN_CI_BUILD"; fi
+          # shellcheck disable=SC2016 # expanded later, inside start's eval
+          if [ "$RUN_TEST" = true ]; then start test "$BUN_CI_TEST"' "${args[@]}"'; fi
+
+          failed=()
+          for i in "${!pids[@]}"; do
+            if wait "${pids[$i]}"; then status=0; else status=$?; fi
+            name=${names[$i]}
+            if [ "$status" -eq 0 ]; then
+              echo "::group::$name passed"
+              cat "$LOGS/$name.log"
+              echo "::endgroup::"
+            else
+              cat "$LOGS/$name.log"
+              echo "::error::$name failed with exit code $status"
+              failed+=("$name")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then exit 1; fi
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.test == 'true' && github.event_name != 'pull_request'
+        with:
+          path: ${{ env.BUN_CI_TIMINGS }}
+          key: bun-ci-timings-${{ runner.os }}-${{ github.sha }}
