@@ -82,7 +82,7 @@ on:
       main-delay:
         description: Seconds a push to the default branch waits before running, so a newer push cancels it first. 0 disables the wait.
         type: number
-        default: 60
+        default: 0
       timeout-minutes:
         type: number
         default: 30

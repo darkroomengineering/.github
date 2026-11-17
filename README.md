@@ -76,7 +76,7 @@ errors much faster. Name the script `typecheck`, not `check`: `bun check` runs a
 | `single-job` | Run every step in one job, as on self-hosted runners. For small projects whose checks take seconds. | `false` |
 | `shards` | Test jobs on GitHub-hosted runners, 1 to 8. Ignored with `single-job`. | `1` |
 | `no-isolate` | One-job mode only (self-hosted or `single-job`): `bun test --parallel --no-isolate`. Faster, but test files can see each other's leftovers. | `false` |
-| `main-delay` | Seconds a push to the default branch waits, so a newer push cancels it first. `0` turns it off. | `60` |
+| `main-delay` | Seconds a push to the default branch waits, so a newer push cancels it first. `0` turns it off. | `0` |
 | `timeout-minutes` | Per job. | `30` |
 
 How it runs:
