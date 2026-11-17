@@ -64,7 +64,7 @@ on:
         type: string
         default: ""
       id:
-        description: Names this call's timings cache and artifacts. Set it when one workflow calls bun-ci more than once.
+        description: Names this call's timings cache, artifacts and concurrency groups. Set it when one workflow calls bun-ci more than once.
         type: string
         default: main
       single-job:
@@ -94,7 +94,7 @@ permissions:
 # `settle` job cancels a superseded push to the default branch while it is still waiting. The group
 # must differ from any group in the caller, or GitHub cancels the run as a deadlock.
 concurrency:
-  group: bun-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: bun-ci-${{ github.workflow }}-${{ inputs.id }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -124,7 +124,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     concurrency:
-      group: bun-ci-settle-${{ github.workflow }}-${{ github.ref }}
+      group: bun-ci-settle-${{ github.workflow }}-${{ inputs.id }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - name: Wait for a newer push
