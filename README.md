@@ -73,8 +73,9 @@ errors much faster. Name the script `typecheck`, not `check`: `bun check` runs a
 | `lint-paths`, `typecheck-paths`, `build-paths`, `test-paths` | Git pathspecs, one per line. A pull request that touches none of them skips that step. `:!docs` style exclusions alone mean "anything else". | Empty, always run |
 | `full-test-paths` | Extra pathspecs that make a pull request run every test, such as fixtures read from disk. | Empty |
 | `id` | Names this call's timings cache and artifacts. Set it when one workflow calls bun-ci more than once. | `main` |
-| `shards` | Test jobs on GitHub-hosted runners, 1 to 8. | `1` |
-| `no-isolate` | Self-hosted only: `bun test --parallel --no-isolate`. Faster, but test files can see each other's leftovers. | `false` |
+| `single-job` | Run every step in one job, as on self-hosted runners. For small projects whose checks take seconds. | `false` |
+| `shards` | Test jobs on GitHub-hosted runners, 1 to 8. Ignored with `single-job`. | `1` |
+| `no-isolate` | One-job mode only (self-hosted or `single-job`): `bun test --parallel --no-isolate`. Faster, but test files can see each other's leftovers. | `false` |
 | `main-delay` | Seconds a push to the default branch waits, so a newer push cancels it first. `0` turns it off. | `60` |
 | `timeout-minutes` | Per job. | `30` |
 
@@ -86,6 +87,8 @@ How it runs:
   the steps as parallel processes and the tests with `bun test --parallel`, because
   those machines are few and busy. Never point a public repository's pull requests
   at a self-hosted runner: a fork's pull request would run its code on that machine.
+- **`single-job: true`** runs the same one-job mode on a GitHub-hosted runner. Use it
+  when the checks take seconds: separate jobs then mostly repeat checkout and install.
 - **Pull requests** run only the tests the diff can reach (`bun test --changed`
   against the base branch). That follows imports only, so a change to a manifest,
   lockfile, tsconfig, bunfig, `.github` or `full-test-paths` runs every test.

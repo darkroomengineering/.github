@@ -3,9 +3,10 @@ name: bun-ci
 # Lint, typecheck, build and test for a Bun project, called from the project's own workflow.
 #
 # On GitHub-hosted runners each step is its own job and tests split into `shards` jobs, all in
-# parallel. On a self-hosted runner (a `runs-on` list that includes "self-hosted") one job runs the
-# steps as parallel processes and the tests with `bun test --parallel`, because those runners are
-# few and CPU-bound.
+# parallel. On a self-hosted runner (a `runs-on` list that includes "self-hosted"), or with
+# `single-job`, one job runs the steps as parallel processes and the tests with
+# `bun test --parallel`: self-hosted runners are few and CPU-bound, and a small project spends most
+# of each extra job on setup.
 #
 # Pull requests skip steps whose paths did not change and run only the tests the diff can reach
 # (`bun test --changed`). Every other event runs everything. Full runs record per-file test times in
@@ -66,12 +67,16 @@ on:
         description: Names this call's timings cache and artifacts. Set it when one workflow calls bun-ci more than once.
         type: string
         default: main
+      single-job:
+        description: Run every step in one job, as on self-hosted runners. For projects whose checks take seconds, where each extra job mostly repeats setup.
+        type: boolean
+        default: false
       shards:
-        description: Test jobs on GitHub-hosted runners, 1 to 8.
+        description: Test jobs on GitHub-hosted runners, 1 to 8. Ignored with single-job.
         type: number
         default: 1
       no-isolate:
-        description: On self-hosted runners, pass --no-isolate to `bun test --parallel`. Faster, but test files can see each other's leftovers.
+        description: In the one-job mode (self-hosted or single-job), pass --no-isolate to `bun test --parallel`. Faster, but test files can see each other's leftovers.
         type: boolean
         default: false
       main-delay:
@@ -131,7 +136,7 @@ jobs:
     needs: settle
     if: >-
       !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
-      !contains(inputs.runs-on, 'self-hosted') && inputs.lint != ''
+      !contains(inputs.runs-on, 'self-hosted') && !inputs.single-job && inputs.lint != ''
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -235,7 +240,7 @@ jobs:
     needs: settle
     if: >-
       !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
-      !contains(inputs.runs-on, 'self-hosted') && inputs.typecheck != ''
+      !contains(inputs.runs-on, 'self-hosted') && !inputs.single-job && inputs.typecheck != ''
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -255,7 +260,7 @@ jobs:
     needs: settle
     if: >-
       !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
-      !contains(inputs.runs-on, 'self-hosted') && inputs.build != ''
+      !contains(inputs.runs-on, 'self-hosted') && !inputs.single-job && inputs.build != ''
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -276,7 +281,7 @@ jobs:
     needs: settle
     if: >-
       !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
-      !contains(inputs.runs-on, 'self-hosted') && inputs.test != ''
+      !contains(inputs.runs-on, 'self-hosted') && !inputs.single-job && inputs.test != ''
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -368,14 +373,20 @@ jobs:
     needs: settle
     if: >-
       !cancelled() && (needs.settle.result == 'success' || needs.settle.result == 'skipped') &&
-      contains(inputs.runs-on, 'self-hosted')
+      (contains(inputs.runs-on, 'self-hosted') || inputs.single-job)
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - *checkout
       - *scope
       - *setup-bun
-      # No install cache: a self-hosted runner keeps ~/.bun/install/cache between runs.
+      # A self-hosted runner keeps ~/.bun/install/cache between runs; GitHub-hosted ones need the cache.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.scope.outputs.run == 'true' && !contains(inputs.runs-on, 'self-hosted')
+        with:
+          path: ~/.bun/install/cache
+          key: bun-ci-install-${{ runner.os }}-${{ hashFiles('bun.lock', 'bun.lockb') }}
+          restore-keys: bun-ci-install-${{ runner.os }}-
       - *install
       - *setup
       - *restore-timings
