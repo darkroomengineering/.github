@@ -19,6 +19,7 @@ CI components. Workflows and actions are not inherited by other repositories.
 | `.github/FUNDING.yml` | Sponsor button configuration. |
 | `actions/bun-web-ci/action.yml` | Shared Bun installation, production build and project checks. |
 | `.github/workflows/dependabot-merge.yml` | Guarded merge workflow for explicitly selected Dependabot policies. |
+| `.github/workflows/bun-ci.yml` | Reusable lint, typecheck, build and test workflow for Bun projects. |
 | `.github/workflows/ci-gate.yml` | Org-required check on every default branch (see below). |
 
 ## Shared CI components
@@ -43,6 +44,56 @@ as a step after checkout. The caller owns its triggers, job names, read-only
 permissions, runner, timeout and cancellation policy. Keep browser tests and
 advisory jobs in the caller. For Satus, pass both inputs; for Lenis Showcase Admin,
 use the defaults. This action does not skip tests or accept arbitrary commands.
+
+### Bun CI workflow
+
+`bun-ci.yml` runs lint, typecheck, build and tests in parallel for a Bun project.
+Call it as a job:
+
+```yaml
+jobs:
+  bun:
+    uses: darkroomengineering/.github/.github/workflows/bun-ci.yml@<ref>
+    with:
+      runs-on: '"ubuntu-latest"'
+```
+
+Each command is an input, and an empty command skips that step. The defaults are
+`bun run lint`, `bun run typecheck`, no build, and `bun test`. Typecheck with
+`bun check`, which reads the same tsconfig as `tsc --noEmit` and reports the same
+errors much faster. Name the script `typecheck`, not `check`: `bun check` runs a
+`check` script when the project has one, so use `bun check --no-script` there.
+
+| Input | Purpose | Default |
+| --- | --- | --- |
+| `runs-on` | Runner as JSON: a label or a list of labels. | `"ubuntu-latest"` |
+| `bun-version` | Bun to install. Empty reads `packageManager` from `package.json`. | Empty |
+| `setup` | Command after install in every job, such as `bun next typegen`. | Empty |
+| `lint`, `typecheck`, `build`, `test` | The commands. The workflow appends `bun test` flags to `test`. | See above |
+| `lint-paths`, `typecheck-paths`, `build-paths`, `test-paths` | Git pathspecs, one per line. A pull request that touches none of them skips that step. `:!docs` style exclusions alone mean "anything else". | Empty, always run |
+| `full-test-paths` | Extra pathspecs that make a pull request run every test, such as fixtures read from disk. | Empty |
+| `shards` | Test jobs on GitHub-hosted runners, 1 to 8. | `1` |
+| `no-isolate` | Self-hosted only: `bun test --parallel --no-isolate`. Faster, but test files can see each other's leftovers. | `false` |
+| `main-delay` | Seconds a push to the default branch waits, so a newer push cancels it first. `0` turns it off. | `60` |
+| `timeout-minutes` | Per job. | `30` |
+
+How it runs:
+
+- **GitHub-hosted runners.** Lint, typecheck, build and each test shard are separate
+  jobs. Shards split the files by their recorded run time.
+- **Self-hosted runners** (a `runs-on` list containing `self-hosted`). One job runs
+  the steps as parallel processes and the tests with `bun test --parallel`, because
+  those machines are few and busy. Never point a public repository's pull requests
+  at a self-hosted runner: a fork's pull request would run its code on that machine.
+- **Pull requests** run only the tests the diff can reach (`bun test --changed`
+  against the base branch). That follows imports only, so a change to a manifest,
+  lockfile, tsconfig, bunfig, `.github` or `full-test-paths` runs every test.
+  Pull requests cancel their previous run.
+- **Every other event** runs everything. Full runs save per-file test times to the
+  Actions cache, and pull requests read the times their base branch saved.
+
+The called workflow sets its own concurrency group, so callers should not set one on
+the job that calls it.
 
 ## Required default-branch gate
 
